@@ -3,119 +3,128 @@
  * Reads center 4 pixels from each ToF sensor and full IMU data
  * Includes Fall Detection using IMU with Pitch, Roll, and Yaw
  * Sends data via LoRa to receiver
+ * Uses WebServer for HTTP communication
+ * Distance-based stopping (stops when distance increases significantly)
  */
 
 // ===================== LIBRARIES =====================
 #include <Wire.h>                       // I2C communication library
-#include <SparkFun_VL53L5CX_Library.h>  // For VL53L5CX ToF sensors
-#include "ICM_20948.h"                  // For ICM-20948 IMU
-#include <WiFi.h>                       // WiFi connectivity
-#include <WiFiClient.h>                 // WiFi client functionality
-#include <WiFiServer.h>                 // WiFi server functionality
-#include <math.h>                       // Math functions (atan2, sqrt)
-#include <LoRa.h>                       // LoRa wireless communication
-#include <SPI.h>                        // SPI communication protocol
+#include <SparkFun_VL53L5CX_Library.h>  // Distance sensor library
+#include "ICM_20948.h"                  // IMU sensor library
+#include <WiFi.h>                       // WiFi library for ESP32
+#include <WebServer.h>                  // WebServer library
+#include <math.h>                       // Math functions library
+#include <LoRa.h>                       // LoRa wireless library
+#include <SPI.h>                        // SPI communication library
+#include "Kalman.h"                     // Kalman filter library
 
-// WiFi network credentials
-const char* ssid = "Abinow";            // WiFi network name
-const char* password = "12345678";      // WiFi password
+//---------------------------------------------------------------------------------------------------------------------------------------
+// WiFi network settings
+const char *ssid = "MyESP32_AP";        // WiFi network name
+const char *password = "12345678";      // WiFi password
 
-// Create a server on port 80
-WiFiServer server(80);
-// Client object for handling connections
-WiFiClient client;
-// String to store received data
-String data = "";
+// Create a WebServer on port 80
+WebServer server(80);                   // Web server on port 80
 
+// ===================== HARDWARE CONFIG =====================
 // LoRa module pin definitions
-#define LORA_SS 5                       // Slave select pin
-#define LORA_RST 14                     // Reset pin
-#define LORA_DIO0 2                     // Digital IO 0 pin
+#define LORA_SS 5                       // LoRa chip select pin
+#define LORA_RST 14                     // LoRa reset pin
+#define LORA_DIO0 2                     // LoRa interrupt pin
 
 // Motor and actuator control pins
-#define pwm_drive 16                    // Drive motor PWM pin
+#define pwm_drive 16                    // Drive motor speed pin
 #define dir_drive 15                    // Drive motor direction pin
-#define pwm_brush 18                    // Brush motor PWM pin
+#define pwm_brush 18                    // Brush motor speed pin
 #define dir_brush 17                    // Brush motor direction pin
-#define lin_act_1_pwm 3                 // Linear actuator PWM pin
-#define lin_act_1_dir 6                 // Linear actuator direction pin
+#define lin_act_1_pwm 3                 // Actuator speed pin
+#define lin_act_1_dir 6                 // Actuator direction pin
 
 // ===================== TOF CONFIG =====================
-SparkFun_VL53L5CX myImager1;            // First ToF sensor object
-SparkFun_VL53L5CX myImager2;            // Second ToF sensor object
+SparkFun_VL53L5CX myImager1;            // First distance sensor object
+SparkFun_VL53L5CX myImager2;            // Second distance sensor object
 
-int sensorAddress1 = 0x44;              // Custom I2C address for sensor 1
+int sensorAddress1 = 0x44;              // Custom address for sensor 1
 int sensorAddress2 = 0x29;              // Default address for sensor 2
 
-int sensorReset1 = 47;                  // GPIO pin for sensor 1 reset
-int sensorReset2 = 48;                  // GPIO pin for sensor 2 reset
+int sensorReset1 = 47;                  // Reset pin for sensor 1
+int sensorReset2 = 48;                  // Reset pin for sensor 2
 
 VL53L5CX_ResultsData measurementData1;  // Storage for sensor 1 data
 VL53L5CX_ResultsData measurementData2;  // Storage for sensor 2 data
 
-int imageResolution = 0;                // Stores resolution (e.g., 64 for 8x8)
-int imageWidth = 0;                     // Grid width (e.g., 8)
+int imageResolution = 0;                // Stores resolution value
+int imageWidth = 0;                     // Grid width size
 
-// ====== Obstacle detection config ======
-unsigned long lastToFCheck = 0;         // Last time ToF was checked
-const uint16_t OBSTACLE_THRESHOLD = 300; // Obstacle distance threshold in mm (30 cm)
+// ====== Distance tracking config ======
+unsigned long lastToFCheck = 0;         // Last time distance was checked
+int initialTof1Distance = 0;           // Initial distance for sensor 1
+int initialTof2Distance = 0;           // Initial distance for sensor 2
+bool initialDistanceSet = false;       // Flag if initial distances are set
+const uint16_t DISTANCE_TOLERANCE = 100; // 10cm tolerance (100mm)
 
 // ====== FALL DETECTION CONFIG (IMU) ======
-#define MAX_DELTA_PITCH_ROLL 20.0       // Max allowed tilt change in degrees
-#define MAX_DELTA_YAW 45.0              // Max allowed yaw change in degrees
+#define MAX_DELTA_PITCH_ROLL 20.0       // Max allowed tilt change
+#define MAX_DELTA_YAW 45.0              // Max allowed yaw change
 
 unsigned long lastIMUCheck = 0;         // Last time IMU was checked
 const uint16_t IMU_CHECK_INTERVAL = 100; // Check every 100ms
 unsigned long lastIMUUpdate = 0;        // Last time IMU was updated
 
 // IMU angle variables
-float initialPitch = 0.0;               // Initial pitch angle reference
-float initialRoll = 0.0;                // Initial roll angle reference
-float initialYaw = 0.0;                 // Initial yaw angle reference
+float initialPitch = 0.0;               // Starting pitch angle
+float initialRoll = 0.0;                // Starting roll angle
+float initialYaw = 0.0;                 // Starting yaw angle
 float currentPitch = 0.0;               // Current pitch angle
 float currentRoll = 0.0;                // Current roll angle
 float currentYaw = 0.0;                 // Current yaw angle
 
-bool isInitialAngleSet = false;         // Flag if initial angles are set
+// Kalman filters for each axis
+Kalman kalmanRoll;                      // Filter for roll angle
+Kalman kalmanPitch;                     // Filter for pitch angle
+Kalman kalmanYaw;                       // Filter for yaw angle
+
+// Filtered IMU output
+float imuPitch = 0.0;                   // Filtered pitch angle
+float imuRoll = 0.0;                    // Filtered roll angle
+float imuYaw = 0.0;                     // Filtered yaw angle
+
+bool isInitialAngleSet = false;         // Flag if angles are set
 
 // Motor control variables
-int rpm = 0;                            // Motor RPM value
+int rpm = 0;                            // Motor speed value
 int pos = 0;                            // Current actuator position
 int new_pos = 0;                        // Target actuator position
 int dist = 0;                           // Distance to move actuator
-int linear_actr_pwm = 255;              // PWM value for linear actuator
+int linear_actr_pwm = 255;              // Actuator speed value
 long lastMPUCheck = 0;                  // Last time MPU was checked
-long lastActionTime = 0;                // Last time an action was performed
+long lastActionTime = 0;                // Last time action was performed
 long lastCurrentCheck = 0;              // Last time current was checked
 
 // ====== ROBOT STATUS FLAGS ======
-bool driveMoving = false;               // Flag if drive motor is moving
-bool brushMoving = false;               // Flag if brush motor is moving
-bool actuatorMoving = false;            // Flag if linear actuator is moving
-bool botDisoriented = false;            // Flag if robot is disoriented/fallen
-bool obstacleDetected = false;          // Flag if obstacle is detected
-bool emergencyStop = false;             // Flag if emergency stop is activated
+bool driveMoving = false;               // Is drive motor moving?
+bool brushMoving = false;               // Is brush motor moving?
+bool actuatorMoving = false;            // Is actuator moving?
+bool botDisoriented = false;            // Is robot fallen?
+bool obstacleDetected = false;          // Is distance alert active?
+bool emergencyStop = false;             // Is emergency stop active?
 
 // Sensor values for LoRa transmission
-int tof1Distance = 0;                   // Distance from ToF sensor 1
-int tof2Distance = 0;                   // Distance from ToF sensor 2
-float imuPitch = 0.0;                   // Pitch angle from IMU
-float imuRoll = 0.0;                    // Roll angle from IMU
-float imuYaw = 0.0;                     // Yaw angle from IMU
+int tof1Distance = 0;                   // Distance from sensor 1
+int tof2Distance = 0;                   // Distance from sensor 2
 
 // IMU raw data values
-float accelX = 0.0, accelY = 0.0, accelZ = 0.0;
-float gyroX = 0.0, gyroY = 0.0, gyroZ = 0.0;
-float magX = 0.0, magY = 0.0, magZ = 0.0;
-float temperature = 0.0;
+float accelX = 0.0, accelY = 0.0, accelZ = 0.0;  // Acceleration values
+float gyroX = 0.0, gyroY = 0.0, gyroZ = 0.0;     // Rotation values
+float magX = 0.0, magY = 0.0, magZ = 0.0;        // Magnetic field values
 
 // LoRa transmission timing
-unsigned long lastLoRaTransmission = 0; // Last time data was sent via LoRa
-const uint16_t LORA_INTERVAL = 2000;    // Send data every 2 seconds
+unsigned long lastLoRaTransmission = 0; // Last time data was sent
+const uint16_t LORA_INTERVAL = 1000;    // Send data every 1 second
 
 // ===================== IMU CONFIG =====================
 #define WIRE_PORT_IMU Wire1             // Use second I2C port for IMU
-#define AD0_VAL 1                       // I2C address bit (1 = HIGH)
+#define AD0_VAL 1                       // I2C address bit
 #define SERIAL_PORT Serial              // Alias for Serial output
 
 ICM_20948_I2C myICM;                    // IMU sensor object
@@ -124,33 +133,34 @@ ICM_20948_I2C myICM;                    // IMU sensor object
 void setup() {
   // Initialize serial communication
   SERIAL_PORT.begin(115200);            // Start serial at 115200 baud
-  delay(1000);                          // Wait for serial monitor
+  delay(1000);                          // Wait 1 second
   SERIAL_PORT.println("Starting Dual ToF + IMU + LoRa Example");
+  SERIAL_PORT.println("Distance-based stopping: Robot will stop when distance increases by 10cm");
 
   // --------- LoRa Initialization ---------
   SERIAL_PORT.println("Initializing LoRa...");
-  LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);  // Set LoRa module pins
+  LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);  // Set LoRa pins
   
-  while (!LoRa.begin(433E6)) {          // Initialize LoRa at 433MHz
-    SERIAL_PORT.println(".");           // Print dots while initializing
-    delay(500);                         // Wait 500ms between attempts
+  while (!LoRa.begin(433E6)) {          // Try to start LoRa at 433MHz
+    SERIAL_PORT.println(".");           // Print dot while trying
+    delay(500);                         // Wait 500ms
   }
   LoRa.setSyncWord(0xA5);               // Set LoRa sync word
   SERIAL_PORT.println("LoRa Initializing OK!");
 
   // --------- I2C Initialization ---------
-  Wire.begin();                         // Initialize primary I2C bus
-  Wire.setClock(1000000);               // Set to 1MHz for ToF sensors
+  Wire.begin();                         // Start first I2C bus
+  Wire.setClock(1000000);               // Set fast speed for sensors
 
-  WIRE_PORT_IMU.begin(35,36);           // Initialize secondary I2C for IMU
-  WIRE_PORT_IMU.setClock(400000);       // 400kHz for IMU
+  WIRE_PORT_IMU.begin(35,36);           // Start second I2C for IMU
+  WIRE_PORT_IMU.setClock(400000);       // Set medium speed for IMU
 
   // --------- ToF Sensor Initialization ---------
   // Reset sequence for sensor 1
-  pinMode(sensorReset2, OUTPUT);        // Set sensor 2 reset pin as output
+  pinMode(sensorReset2, OUTPUT);        // Set sensor 2 reset pin
   digitalWrite(sensorReset2, HIGH);     // Hold sensor 2 in reset
 
-  pinMode(sensorReset1, OUTPUT);        // Set sensor 1 reset pin as output
+  pinMode(sensorReset1, OUTPUT);        // Set sensor 1 reset pin
   digitalWrite(sensorReset1, HIGH);     // Reset sensor 1
   delay(100);                           // Wait 100ms
   digitalWrite(sensorReset1, LOW);      // Release sensor 1
@@ -158,60 +168,82 @@ void setup() {
 
   // Initialize sensor 1 with custom address
   SERIAL_PORT.println("Initializing ToF Sensor 1");
-  if (!myImager1.begin()) {             // Try to initialize sensor 1
+  if (!myImager1.begin()) {             // Try to start sensor 1
     SERIAL_PORT.println("Sensor 1 not found. Freezing...");
-    while (1);                          // Halt if initialization fails
+    while (1);                          // Stop if failed
   }
   myImager1.setAddress(sensorAddress1); // Change sensor 1 address
 
   // Release and initialize sensor 2
-  digitalWrite(sensorReset2, LOW);      // Release sensor 2 from reset
+  digitalWrite(sensorReset2, LOW);      // Release sensor 2
   delay(100);                           // Wait 100ms
   SERIAL_PORT.println("Initializing ToF Sensor 2");
-  if (!myImager2.begin()) {             // Try to initialize sensor 2
+  if (!myImager2.begin()) {             // Try to start sensor 2
     SERIAL_PORT.println("Sensor 2 not found. Freezing...");
-    while (1);                          // Halt if initialization fails
+    while (1);                          // Stop if failed
   }
-
+  
   // Configure both sensors
-  myImager1.setResolution(8 * 8);       // Set 8x8 grid (64 zones)
-  myImager2.setResolution(8 * 8);       // Set 8x8 grid (64 zones)
-  imageResolution = myImager1.getResolution();  // Get resolution value
-  imageWidth = sqrt(imageResolution);   // Calculate grid width (8)
+  myImager1.setResolution(8 * 8);       // Set 8x8 grid
+  myImager2.setResolution(8 * 8);       // Set 8x8 grid
+  imageResolution = myImager1.getResolution();  // Get resolution
+  imageWidth = sqrt(imageResolution);   // Calculate width
 
   myImager1.setRangingFrequency(15);    // Set 15Hz update rate
   myImager2.setRangingFrequency(15);    // Set 15Hz update rate
 
-  myImager1.startRanging();             // Start continuous measurements
-  myImager2.startRanging();             // Start continuous measurements
+  myImager1.startRanging();             // Start measuring
+  myImager2.startRanging();             // Start measuring
 
   // --------- IMU Initialization ---------
-  bool imuInitialized = false;          // IMU initialization flag
-  while (!imuInitialized) {             // Keep trying until IMU is initialized
-    myICM.begin(WIRE_PORT_IMU, AD0_VAL);  // Initialize IMU
-    SERIAL_PORT.print("IMU Init: ");    // Print initialization status
+  bool imuInitialized = false;          // IMU start flag
+  while (!imuInitialized) {             // Keep trying until IMU starts
+    myICM.begin(WIRE_PORT_IMU, AD0_VAL);  // Try to start IMU
+    SERIAL_PORT.print("IMU Init: ");    // Print status
     SERIAL_PORT.println(myICM.statusString());
     
-    if (myICM.status != ICM_20948_Stat_Ok) {  // If initialization failed
+    if (myICM.status != ICM_20948_Stat_Ok) {  // If failed
       SERIAL_PORT.println("Retrying IMU..."); // Print retry message
-      delay(500);                       // Wait 500ms before retry
+      delay(500);                       // Wait 500ms
     } else {
-      imuInitialized = true;            // Set flag if initialization succeeded
+      imuInitialized = true;            // Set flag if success
     }
   }
 
   // --------- Set Initial Reference Angle for Fall Detection ---------
   SERIAL_PORT.println("Place robot on panel. Calculating initial tilt in 3 seconds...");
-  delay(3000);                          // Give time to position the robot
+  delay(3000);                          // Wait 3 seconds
 
   // Take a reading to set the initial angle
-  if (myICM.dataReady()) {              // If IMU data is ready
-    myICM.getAGMT();                    // Read accelerometer/gyro/mag/temp
+  if (myICM.dataReady()) {              // If IMU data ready
+    myICM.getAGMT();                    // Read sensor data
     calculateTilt(myICM.accX(), myICM.accY(), myICM.accZ(), &initialPitch, &initialRoll);  // Calculate tilt
-    initialYaw = 0.0;                   // Start with yaw at 0 degrees
-    currentYaw = 0.0;                   // Set current yaw to 0
-    isInitialAngleSet = true;           // Mark initial angles as set
-    SERIAL_PORT.print("Reference Angles Set - Pitch: ");  // Print reference angles
+  
+    // ----- Compute averaged magnetometer heading -----
+    float sumHeading = 0;
+    const int samples = 10;               // number of samples for averaging
+    for (int i = 0; i < samples; i++) {
+        myICM.getAGMT();                  // Read fresh IMU data
+        float h = atan2(myICM.magY(), myICM.magX()) * 180.0f / PI;  // raw heading
+        if (h < 0) h += 360.0f;           // normalize 0..360
+        sumHeading += h;
+        delay(50);                        // small delay between readings
+    }
+    float initialMagHeading = sumHeading / samples; // averaged heading
+
+    // Set initial yaw
+    initialYaw = initialMagHeading;
+    currentYaw = initialMagHeading;
+
+    // Initialize Kalman filter
+    kalmanYaw.setAngle(initialYaw);
+  
+    isInitialAngleSet = true;           // Mark angles as set
+    // initialize Kalman filters with reference angles
+    kalmanRoll.setAngle(initialRoll);
+    kalmanPitch.setAngle(initialPitch);
+
+    SERIAL_PORT.print("Reference Angles Set - Pitch: ");  // Print angles
     SERIAL_PORT.print(initialPitch);
     SERIAL_PORT.print("°, Roll: ");
     SERIAL_PORT.print(initialRoll);
@@ -221,49 +253,58 @@ void setup() {
   }
 
   // Pin Modes for motor control
-  pinMode(dir_drive, OUTPUT);           // Set drive direction pin as output
-  pinMode(pwm_drive, OUTPUT);           // Set drive PWM pin as output
-  pinMode(dir_brush, OUTPUT);           // Set brush direction pin as output
-  pinMode(pwm_brush, OUTPUT);           // Set brush PWM pin as output
-  pinMode(lin_act_1_pwm, OUTPUT);       // Set linear actuator PWM pin as output
-  pinMode(lin_act_1_dir, OUTPUT);       // Set linear actuator direction pin as output
+  pinMode(dir_drive, OUTPUT);           // Set drive direction pin
+  pinMode(pwm_drive, OUTPUT);           // Set drive speed pin
+  pinMode(dir_brush, OUTPUT);           // Set brush direction pin
+  pinMode(pwm_brush, OUTPUT);           // Set brush speed pin
+  pinMode(lin_act_1_pwm, OUTPUT);       // Set actuator speed pin
+  pinMode(lin_act_1_dir, OUTPUT);       // Set actuator direction pin
 
   // Reset all status flags
   resetStatusFlags();
+  
+  //----------------------------------------------------------------------------------------------------------------------------------------------
+  // WiFi Setup with WebServer
+  SERIAL_PORT.println("Starting Access Point...");
 
-  // WiFi Setup
-  Serial.println("Connecting to WIFI"); // Print WiFi connection message
-  WiFi.begin(ssid, password);           // Start WiFi connection
-  while (WiFi.status() != WL_CONNECTED) {  // While not connected to WiFi
-    Serial.print(".");                   // Print dots while connecting
-    delay(500);                         // Wait 500ms between attempts
-  }
-  Serial.println("\nWiFi connected");   // Print connection success
-  Serial.print("ESP32 Local IP: ");     // Print local IP address
-  Serial.println(WiFi.localIP());
-  server.begin();                       // Start the web server
+  // Start AP
+  WiFi.softAP(ssid, password);          // Start access point
+
+  SERIAL_PORT.println("Access Point Started");
+  SERIAL_PORT.print("IP Address: ");
+  SERIAL_PORT.println(WiFi.softAPIP()); // Print IP address
+
+  // Setup server routes
+  server.on("/", handleRoot);           // Root page
+  server.on("/data", handleData);       // Data endpoint for commands
+  server.on("/status", handleStatus);   // Status endpoint
+  
+  server.begin();                       // Start web server
+  SERIAL_PORT.println("HTTP server started");
+  SERIAL_PORT.println("Send commands to: http://" + WiFi.softAPIP().toString() + "/data?cmd=COMMAND");
+  SERIAL_PORT.println("Initial distances will be set automatically from first sensor readings");
 }
 
 // ===================== MAIN LOOP =====================
 void loop() {
+  server.handleClient();                // Handle HTTP requests
+
   // -------- ToF Sensor 1 --------
   if (myImager1.isDataReady() && myImager1.getRangingData(&measurementData1)) {  // If sensor 1 has data
-    SERIAL_PORT.println("ToF Sensor 1:");  // Print sensor label
-    tof1Distance = printToFData(measurementData1);  // Get center 4 pixels distance
+    tof1Distance = printToFData(measurementData1);  // Get distance
   }
 
   // -------- ToF Sensor 2 --------
   if (myImager2.isDataReady() && myImager2.getRangingData(&measurementData2)) {  // If sensor 2 has data
-    SERIAL_PORT.println("ToF Sensor 2:");  // Print sensor label
-    tof2Distance = printToFData(measurementData2);  // Get center 4 pixels distance
+    tof2Distance = printToFData(measurementData2);  // Get distance
   }
 
-  // -------- ToF Obstacle Check --------
-  checkToF();                         // Check for obstacles using ToF sensors
+  // -------- Distance Change Check --------
+  checkDistanceChange();               // Check for significant distance increases
 
   // -------- IMU Data Reading --------
-  if (myICM.dataReady()) {            // If IMU data is ready
-    myICM.getAGMT();                   // Read accelerometer/gyro/mag/temp
+  if (myICM.dataReady()) {            // If IMU data ready
+    myICM.getAGMT();                  // Read sensor data
     
     // Store raw IMU data for transmission
     accelX = myICM.accX() / 1000.0;   // Convert to G
@@ -272,106 +313,300 @@ void loop() {
     gyroX = myICM.gyrX();             // Degrees per second
     gyroY = myICM.gyrY();
     gyroZ = myICM.gyrZ();
-    magX = myICM.magX();              // Raw magnetometer data
+    magX = myICM.magX();              // Raw magnetometer
     magY = myICM.magY();
     magZ = myICM.magZ();
-    temperature = myICM.temp();       // Temperature in degrees C
     
-    printScaledAGMT(&myICM);           // Print formatted data
+    printScaledAGMT(&myICM);          // Print data
     
-    // Update IMU values for transmission
-    calculateTilt(myICM.accX(), myICM.accY(), myICM.accZ(), &imuPitch, &imuRoll);  // Calculate tilt
-    updateYawAngle();                  // Update yaw from gyro
-    imuYaw = currentYaw;               // Set IMU yaw to current yaw
+    // ===== Kalman + magnetometer fusion =====
+    unsigned long now = millis();     // Current time
+    float dt = 0.0;                   // Time difference
+    if (lastIMUUpdate == 0) {
+      // first iteration: fall back to IMU_CHECK_INTERVAL
+      dt = IMU_CHECK_INTERVAL / 1000.0f;
+    } else {
+      dt = (now - lastIMUUpdate) / 1000.0f;  // Calculate time difference
+    }
+    lastIMUUpdate = now;              // Update time
+
+    // 1) accelerometer-based angles (degrees)
+    float accRoll  = atan2(accelY, accelZ) * 180.0f / PI;    // Calculate roll
+    float accPitch = atan2(-accelX, sqrt(accelY*accelY + accelZ*accelZ)) * 180.0f / PI;  // Calculate pitch
+
+    // 2) fuse accel + gyro for roll & pitch via Kalman
+    float fusedRoll  = kalmanRoll.getAngle(accRoll, gyroX, dt);   // Filtered roll
+    float fusedPitch = kalmanPitch.getAngle(accPitch, gyroY, dt); // Filtered pitch
+
+    // 3) tilt-compensate magnetometer and compute heading
+    float rollRad  = fusedRoll  * (PI / 180.0f);             // Convert to radians
+    float pitchRad = fusedPitch * (PI / 180.0f);             // Convert to radians
+
+    // Use raw magnetometer readings
+    float mx = magX;
+    float my = magY;
+    float mz = magZ;
+
+    // Tilt compensation
+    float Xh = mx * cos(pitchRad) + mz * sin(pitchRad);      // Compensated X
+    float Yh = mx * sin(rollRad) * sin(pitchRad) + my * cos(rollRad) - mz * sin(rollRad) * cos(pitchRad);  // Compensated Y
+
+    // heading from tilt-compensated mag (0..360)
+    float magHeading = atan2(Yh, Xh) * 180.0f / PI;          // Calculate heading
+    if (magHeading < 0.0f) magHeading += 360.0f;             // Normalize
+
+    static float prevMagHeading = initialYaw;
+    magHeading = 0.9 * prevMagHeading + 0.1 * magHeading;    // Low-pass filter
+    prevMagHeading = magHeading;
+
+    // 4) fuse magnetometer heading + gyroZ with Kalman for yaw
+    float fusedYaw = kalmanYaw.getAngle(magHeading, gyroZ, dt);  // Filtered yaw
+
+    // normalize yaw to -180..180
+    if (fusedYaw > 180.0f) fusedYaw -= 360.0f;               // Normalize
+    if (fusedYaw < -180.0f) fusedYaw += 360.0f;              // Normalize
+
+    // 5) write fused results
+    currentRoll  = fusedRoll;                                // Update roll
+    currentPitch = fusedPitch;                               // Update pitch
+    currentYaw   = fusedYaw;                                 // Update yaw
   }
 
   // -------- Fall Detection Check --------
-  checkIMU();                         // Check for falls using IMU
+  checkIMU();                         // Check for falls
 
   // -------- Handle Actuator Movement --------
-  handleActuator();                   // Handle linear actuator movement
-
-  // -------- Handle WiFi Commands --------
-  handleWiFiClient();                 // Handle incoming WiFi commands
+  handleActuator();                   // Handle actuator
 
   // -------- Send Data via LoRa --------
-  if (millis() - lastLoRaTransmission >= LORA_INTERVAL) {  // If it's time to send LoRa data
-    sendLoRaData();                    // Send data via LoRa
-    lastLoRaTransmission = millis();   // Update last transmission time
+  if (millis() - lastLoRaTransmission >= LORA_INTERVAL) {  // If time to send
+    sendLoRaData();                    // Send data
+    lastLoRaTransmission = millis();   // Update time
   }
 
-  delay(100);                          // Short delay to prevent serial flooding
+  delay(100);                          // Short delay
+}
+
+// ===================== HTTP HANDLERS =====================
+
+/**
+ * Handle root page request
+ */
+void handleRoot() {
+  String html = "<html><head><title>Robot Controller</title></head><body>";
+  html += "<h1>Robot Controller</h1>";
+  html += "<p>Send commands to: /data?cmd=COMMAND</p>";
+  html += "<p>Available commands: fm (forward), rm (reverse), b (brake), ";
+  html += "fb (brush forward), rb (brush reverse), s (stop brush), ";
+  html += "fl (actuator forward), rl (actuator reverse), p (stop actuator), ";
+  html += "x (reset flags), resetdist (reset initial distances)</p>";
+  html += "<p>Format: command + value (e.g., fm255, rm120, fb200)</p>";
+  html += "<p><strong>Distance Monitoring:</strong> Robot stops when distance increases by 10cm from initial reading</p>";
+  html += "<p><a href='/status'>Check Status</a></p>";
+  html += "</body></html>";
+  
+  server.send(200, "text/html", html);
+}
+
+/**
+ * Handle data commands
+ */
+void handleData() {
+  if (!server.hasArg("cmd")) {
+    server.send(400, "text/plain", "Missing cmd parameter");
+    return;
+  }
+
+  String data = server.arg("cmd");    // Get command like "fm255"
+  
+  if (data.length() == 0) {
+    server.send(400, "text/plain", "Empty command");
+    return;
+  }
+
+  // Extract command letter and value
+  String commandPart = "";
+  String valuePart = "";
+  
+  for (int i = 0; i < data.length(); i++) {
+    if (isAlpha(data.charAt(i))) {
+      commandPart += data.charAt(i);
+    } else if (isDigit(data.charAt(i))) {
+      valuePart += data.charAt(i);
+    }
+  }
+  
+  int value = valuePart.toInt();
+
+  SERIAL_PORT.print("Received HTTP command: ");
+  SERIAL_PORT.print(commandPart);
+  SERIAL_PORT.print(" with value: ");
+  SERIAL_PORT.println(value);
+
+  // Execute command
+  if (commandPart == "fm") forward(value);
+  else if (commandPart == "rm") reverse(value);
+  else if (commandPart == "b") brake();
+  else if (commandPart == "fb") run_brush(value);
+  else if (commandPart == "rb") run_brush_rev(value);
+  else if (commandPart == "s") stop_brush();
+  else if (commandPart == "fl") forward_actuator(value);
+  else if (commandPart == "rl") reverse_actuator(value);
+  else if (commandPart == "p") lin_stop();
+  else if (commandPart == "x") resetStatusFlags();
+  else if (commandPart == "resetdist") {
+    resetInitialDistances();
+    server.send(200, "text/plain", "Initial distances reset");
+    return;
+  }
+  else {
+    server.send(400, "text/plain", "Invalid command: " + commandPart);
+    return;
+  }
+
+  server.send(200, "text/plain", "OK - Command: " + commandPart + " Value: " + String(value));
+}
+
+/**
+ * Handle status request
+ */
+void handleStatus() {
+  String status = "Robot Status:\n";
+  status += "Drive Moving: " + String(driveMoving ? "YES" : "NO") + "\n";
+  status += "Brush Moving: " + String(brushMoving ? "YES" : "NO") + "\n";
+  status += "Actuator Moving: " + String(actuatorMoving ? "YES" : "NO") + "\n";
+  status += "Distance Alert: " + String(obstacleDetected ? "YES" : "NO") + "\n";
+  status += "Bot Disoriented: " + String(botDisoriented ? "YES" : "NO") + "\n";
+  status += "Emergency Stop: " + String(emergencyStop ? "YES" : "NO") + "\n";
+  status += "ToF1 Current: " + String(tof1Distance) + "mm\n";
+  status += "ToF2 Current: " + String(tof2Distance) + "mm\n";
+  status += "ToF1 Initial: " + String(initialTof1Distance) + "mm\n";
+  status += "ToF2 Initial: " + String(initialTof2Distance) + "mm\n";
+  status += "Distance Set: " + String(initialDistanceSet ? "YES" : "NO") + "\n";
+  status += "Tolerance: " + String(DISTANCE_TOLERANCE) + "mm\n";
+  status += "Pitch: " + String(currentPitch, 1) + "°\n";
+  status += "Roll: " + String(currentRoll, 1) + "°\n";
+  status += "Yaw: " + String(currentYaw, 1) + "°\n";
+  
+  server.send(200, "text/plain", status);
 }
 
 // ===================== HELPER FUNCTIONS =====================
 
 /**
  * Prints average distance of center 4 pixels in centimeters and returns value
- * @param data VL53L5CX measurement data structure
- * @return Average distance in mm
  */
 int printToFData(VL53L5CX_ResultsData &data) {
-  const int centerIndices[] = {27, 28, 35, 36};  // Center pixel indices (8x8 grid)
-  float sum = 0;                    // Initialize sum variable
+  const int centerIndices[] = {27, 28, 35, 36};  // Center pixel positions
+  float sum = 0;                    // Initialize sum
   
   // Sum distances from center pixels
-  for (int i = 0; i < 4; i++) {    // Loop through 4 center pixels
-    sum += data.distance_mm[centerIndices[i]];  // Add distance to sum
+  for (int i = 0; i < 4; i++) {    // Loop through 4 pixels
+    sum += data.distance_mm[centerIndices[i]];  // Add distance
   }
   
-  int avgDistance = sum / 4.0f;     // Calculate average distance
-  
-  // Convert to cm and print average
-  SERIAL_PORT.print("Center avg: ");  // Print label
-  SERIAL_PORT.print(avgDistance / 10.0f, 1);  // mm→cm (divide by 10)
-  SERIAL_PORT.println(" cm");        // Print unit
-
-  return avgDistance;               // Return average distance
+  int avgDistance = sum / 4.0f;     // Calculate average
+  return avgDistance;               // Return average
 }
 
-// === obstacle check function  ===
-void checkToF() {
-  if (millis() - lastToFCheck >= 100) {  // If 100ms has passed since last check
-    lastToFCheck = millis();            // Update last check time
+/**
+ * Check for significant distance increases using ToF sensors
+ * Stops robot if current distance > initial distance + tolerance
+ */
+void checkDistanceChange() {
+  if (millis() - lastToFCheck >= 100) {  // If 100ms passed
+    lastToFCheck = millis();            // Update time
 
-    int dist1 = -1;                     // Initialize sensor 1 distance
-    int dist2 = -1;                     // Initialize sensor 2 distance
-    bool newObstacleDetected = false;   // Temporary obstacle detection flag
+    int currentDist1 = -1;              // Current sensor 1 distance
+    int currentDist2 = -1;              // Current sensor 2 distance
+    bool shouldStop = false;            // Flag to stop robot
 
     // --- Sensor 1 ---
-    if (myImager1.isDataReady() && myImager1.getRangingData(&measurementData1)) {  // If sensor 1 has data
-      const int centerIndices[] = {27, 28, 35, 36};  // Center pixel indices
-      float sum = 0;                  // Initialize sum
-      for (int i = 0; i < 4; i++) sum += measurementData1.distance_mm[centerIndices[i]];  // Sum center distances
-      dist1 = sum / 4.0f;             // Calculate average distance
+    if (myImager1.isDataReady() && myImager1.getRangingData(&measurementData1)) {
+      const int centerIndices[] = {27, 28, 35, 36};
+      float sum = 0;
+      for (int i = 0; i < 4; i++) sum += measurementData1.distance_mm[centerIndices[i]];
+      currentDist1 = sum / 4.0f;
+      
+      // Set initial distance if not set
+      if (!initialDistanceSet && currentDist1 > 0) {
+        initialTof1Distance = currentDist1;
+        Serial.print("Initial ToF1 distance set to: ");
+        Serial.print(initialTof1Distance);
+        Serial.println("mm");
+      }
     }
 
     // --- Sensor 2 ---
-    if (myImager2.isDataReady() && myImager2.getRangingData(&measurementData2)) {  // If sensor 2 has data
-      const int centerIndices[] = {27, 28, 35, 36};  // Center pixel indices
-      float sum = 0;                  // Initialize sum
-      for (int i = 0; i < 4; i++) sum += measurementData2.distance_mm[centerIndices[i]];  // Sum center distances
-      dist2 = sum / 4.0f;             // Calculate average distance
+    if (myImager2.isDataReady() && myImager2.getRangingData(&measurementData2)) {
+      const int centerIndices[] = {27, 28, 35, 36};
+      float sum = 0;
+      for (int i = 0; i < 4; i++) sum += measurementData2.distance_mm[centerIndices[i]];
+      currentDist2 = sum / 4.0f;
+      
+      // Set initial distance if not set
+      if (!initialDistanceSet && currentDist2 > 0) {
+        initialTof2Distance = currentDist2;
+        Serial.print("Initial ToF2 distance set to: ");
+        Serial.print(initialTof2Distance);
+        Serial.println("mm");
+        
+        // Mark initial distances as set once both are read
+        if (initialTof1Distance > 0 && initialTof2Distance > 0) {
+          initialDistanceSet = true;
+          Serial.println("Initial distances set for both sensors");
+          Serial.print("Tolerance: ");
+          Serial.print(DISTANCE_TOLERANCE);
+          Serial.println("mm");
+        }
+      }
     }
 
-    // --- Obstacle detection ---
-    if ((dist1 > 0 && dist1 < OBSTACLE_THRESHOLD) ||  // If sensor 1 detects obstacle
-        (dist2 > 0 && dist2 < OBSTACLE_THRESHOLD)) {  // Or sensor 2 detects obstacle
-      newObstacleDetected = true;     // Set temporary obstacle flag
-    }
+    // --- Check distance changes only after initial distances are set ---
+    if (initialDistanceSet) {
+      // Check if current distance exceeds initial distance + tolerance
+      if (currentDist1 > 0 && currentDist1 > (initialTof1Distance + DISTANCE_TOLERANCE)) {
+        Serial.print("ToF1 distance increased: ");
+        Serial.print(currentDist1);
+        Serial.print("mm > ");
+        Serial.print(initialTof1Distance + DISTANCE_TOLERANCE);
+        Serial.println("mm (initial + tolerance)");
+        shouldStop = true;
+      }
+      
+      if (currentDist2 > 0 && currentDist2 > (initialTof2Distance + DISTANCE_TOLERANCE)) {
+        Serial.print("ToF2 distance increased: ");
+        Serial.print(currentDist2);
+        Serial.print("mm > ");
+        Serial.print(initialTof2Distance + DISTANCE_TOLERANCE);
+        Serial.println("mm (initial + tolerance)");
+        shouldStop = true;
+      }
 
-    // Only print message and stop motors if obstacle status changed
-    if (newObstacleDetected && !obstacleDetected) {
-      obstacleDetected = true;        // Set obstacle flag
-      Serial.println("Obstacle detected by ToF! Stopping motors...");
-      stop_brush();                   // Stop brush motor
-      brake();                        // Stop drive motor
-    } 
-    else if (!newObstacleDetected && obstacleDetected) {
-      obstacleDetected = false;       // Clear obstacle flag
-      Serial.println("Obstacle cleared.");
+      // Only take action if status changed
+      if (shouldStop && !obstacleDetected) {
+        obstacleDetected = true;
+        Serial.println("Distance increased significantly! Stopping motors...");
+        stop_brush();                   // Stop brush
+        brake();                        // Stop drive
+      } 
+      else if (!shouldStop && obstacleDetected) {
+        obstacleDetected = false;
+        Serial.println("Distance returned to normal range.");
+      }
     }
   }
+}
+
+/**
+ * Reset initial distances to current readings
+ */
+void resetInitialDistances() {
+  initialDistanceSet = false;
+  initialTof1Distance = 0;
+  initialTof2Distance = 0;
+  obstacleDetected = false;
+  Serial.println("Initial distances reset. New distances will be set on next reading.");
 }
 
 /**
@@ -381,63 +616,56 @@ void updateYawAngle() {
   static unsigned long lastUpdate = 0;  // Last update time
   unsigned long now = millis();         // Current time
   
-  if (lastUpdate == 0) {               // If first update
-    lastUpdate = now;                  // Set last update time
-    return;                            // Exit function
+  if (lastUpdate == 0) {               // If first time
+    lastUpdate = now;                  // Set time
+    return;                            // Exit
   }
   
-  float dt = (now - lastUpdate) / 1000.0; // Convert time difference to seconds
-  lastUpdate = now;                    // Update last update time
+  float dt = (now - lastUpdate) / 1000.0; // Time difference in seconds
+  lastUpdate = now;                    // Update time
   
-  // Integrate gyroscope Z-axis data (dps to degrees)
-  float gyroZ_dps = myICM.gyrZ();      // Get gyro Z value in degrees per second
-  currentYaw += gyroZ_dps * dt;        // Integrate to get yaw angle
+  // Integrate gyroscope data
+  float gyroZ_dps = myICM.gyrZ();      // Get rotation speed
+  currentYaw += gyroZ_dps * dt;        // Calculate new yaw
   
-  // Keep yaw between -180 and 180 degrees
-  if (currentYaw > 180.0) currentYaw -= 360.0;  // Normalize yaw
-  if (currentYaw < -180.0) currentYaw += 360.0; // Normalize yaw
+  // Keep yaw between -180 and 180
+  if (currentYaw > 180.0) currentYaw -= 360.0;  // Normalize
+  if (currentYaw < -180.0) currentYaw += 360.0; // Normalize
 }
 
-// === Fall Detection Function ===
+/**
+ * Fall Detection Function
+ */
 void checkIMU() {
-  if (millis() - lastIMUCheck >= IMU_CHECK_INTERVAL && isInitialAngleSet) {  // If time to check and angles are set
-    lastIMUCheck = millis();           // Update last check time
+  if (millis() - lastIMUCheck >= IMU_CHECK_INTERVAL && isInitialAngleSet) {  // If time to check
+    lastIMUCheck = millis();           // Update time
 
-    if (myICM.dataReady()) {           // If IMU data is ready
-      myICM.getAGMT();                  // Read new data
+    if (myICM.dataReady()) {           // If data ready
+      myICM.getAGMT();                  // Read data
       
-      // Update yaw angle from gyroscope
-      updateYawAngle();                // Update yaw angle
+      // Update yaw angle
+      updateYawAngle();                // Update yaw
 
-      float currentPitch, currentRoll; // Variables for current angles
-      // Calculate current tilt from raw accelerometer data
+      float currentPitch, currentRoll; // Current angles
+      // Calculate current tilt
       calculateTilt(myICM.accX(), myICM.accY(), myICM.accZ(), &currentPitch, &currentRoll);
 
-      // Calculate how much we've tilted from the start position
+      // Calculate tilt change
       float deltaPitch = abs(currentPitch - initialPitch);  // Pitch change
       float deltaRoll = abs(currentRoll - initialRoll);     // Roll change
       
-      // Handle yaw wrap-around (0-360 degrees)
+      // Handle yaw wrap-around
       float deltaYaw = abs(currentYaw - initialYaw);       // Yaw change
-      if (deltaYaw > 180.0) {          // If change is more than 180 degrees
-        deltaYaw = 360.0 - deltaYaw;   // Adjust for wrap-around
+      if (deltaYaw > 180.0) {          // If over 180
+        deltaYaw = 360.0 - deltaYaw;   // Adjust
       }
 
-      // Print for monitoring
-      Serial.print("IMU Tilt Δ - Pitch: ");  // Print pitch change
-      Serial.print(deltaPitch);
-      Serial.print("°, Roll: ");        // Print roll change
-      Serial.print(deltaRoll);
-      Serial.print("°, Yaw: ");         // Print yaw change
-      Serial.print(deltaYaw);
-      Serial.println("°");
-
-      // Check if any orientation change is too large
-      if (deltaPitch > MAX_DELTA_PITCH_ROLL ||  // If pitch change too large
-          deltaRoll > MAX_DELTA_PITCH_ROLL ||   // Or roll change too large
-          deltaYaw > MAX_DELTA_YAW) {           // Or yaw change too large
+      // Check if change too large
+      if (deltaPitch > MAX_DELTA_PITCH_ROLL ||  // If pitch too much
+          deltaRoll > MAX_DELTA_PITCH_ROLL ||   // Or roll too much
+          deltaYaw > MAX_DELTA_YAW) {           // Or yaw too much
             
-        triggerFallProtocol(deltaPitch, deltaRoll, deltaYaw);  // Trigger fall protocol
+        triggerFallProtocol(deltaPitch, deltaRoll, deltaYaw);  // Trigger fall
       }
     }
   }
@@ -445,111 +673,89 @@ void checkIMU() {
 
 /**
  * Calculates Pitch and Roll angles in degrees from raw accelerometer data
- * @param accX Raw accelerometer X value
- * @param accY Raw accelerometer Y value
- * @param accZ Raw accelerometer Z value
- * @param pitch Calculated pitch angle (output)
- * @param roll Calculated roll angle (output)
  */
 void calculateTilt(int16_t accX, int16_t accY, int16_t accZ, float *pitch, float *roll) {
-  // Convert raw sensor readings to G-Force (approx. 1000 LSB per G for many sensors)
-  float accX_g = accX / 1000.0;       // Convert X acceleration to G
-  float accY_g = accY / 1000.0;       // Convert Y acceleration to G
-  float accZ_g = accZ / 1000.0;       // Convert Z acceleration to G
+  // Convert to G-Force
+  float accX_g = accX / 1000.0;       // X acceleration in G
+  float accY_g = accY / 1000.0;       // Y acceleration in G
+  float accZ_g = accZ / 1000.0;       // Z acceleration in G
 
-  // Calculate Pitch (rotation around Y-axis) using arctangent
+  // Calculate Pitch
   *pitch = atan2(-accX_g, sqrt(accY_g * accY_g + accZ_g * accZ_g)) * 180.0 / PI;
 
-  // Calculate Roll (rotation around X-axis) using arctangent
+  // Calculate Roll
   *roll = atan2(accY_g, accZ_g) * 180.0 / PI;
 }
 
-// === Emergency Fall Protocol ===
+/**
+ * Emergency Fall Protocol
+ */
 void triggerFallProtocol(float dPitch, float dRoll, float dYaw) {
-  botDisoriented = true;               // Set disoriented flag
-  emergencyStop = true;                // Set emergency stop flag
-  Serial.println("!!! FALL DETECTED !!!");  // Print fall detection message
-  Serial.print("Orientation Change - Pitch: ");  // Print orientation changes
+  botDisoriented = true;               // Set fallen flag
+  emergencyStop = true;                // Set emergency flag
+  Serial.println("!!! FALL DETECTED !!!");  // Print message
+  Serial.print("Orientation Change - Pitch: ");  // Print changes
   Serial.print(dPitch);
   Serial.print("°, Roll: ");
   Serial.print(dRoll);
   Serial.print("°, Yaw: ");
   Serial.print(dYaw);
   Serial.println("°");
-  Serial.println("Engaging Emergency Stop...");  // Print emergency stop message
+  Serial.println("Engaging Emergency Stop...");  // Print stop message
 
-  // EMERGENCY STOP: Halt all motors and actuators
-  brake();                            // Stop drive motor
-  stop_brush();                       // Stop brush motor
-  lin_stop();                         // Stop linear actuator
+  // Stop all motors
+  brake();                            // Stop drive
+  stop_brush();                       // Stop brush
+  lin_stop();                         // Stop actuator
 
-  // Send emergency status via LoRa
-  sendLoRaData();                     // Send data via LoRa
+  // Send emergency status
+  sendLoRaData();                     // Send data
 
-  // Optional: Enter a safe state until reset
+  // Stay in safe state
   while (true) {                      // Infinite loop
     delay(1000);                      // Wait 1 second
   }
 }
 
 /**
- * Prints formatted floating-point numbers with leading zeros
- * @param val Value to print
- * @param leading Total number of digits (including before decimal)
- * @param decimals Number of decimal places
- */
-void printFormattedFloat(float val, uint8_t leading, uint8_t decimals) {
-  float aval = abs(val);              // Get absolute value
-  if (val < 0) SERIAL_PORT.print("-");  // Print minus sign if negative
-  else SERIAL_PORT.print(" ");        // Print space if positive
-
-  // Print leading zeros
-  for (uint8_t i = 0; i < leading; i++) {  // Loop through leading digits
-    uint32_t tenpow = pow(10, leading - 1 - i);  // Calculate power of 10
-    if (aval < tenpow) SERIAL_PORT.print("0");  // Print zero if needed
-    else break;                     // Exit loop if no more zeros needed
-  }
-  SERIAL_PORT.print(aval, decimals);  // Print value with specified decimals
-}
-
-/**
- * Prints formatted IMU data (accelerometer in mg, gyro in dps)
- * @param sensor Pointer to IMU object
+ * Prints formatted IMU data
  */
 void printScaledAGMT(ICM_20948_I2C *sensor) {
-  SERIAL_PORT.print("IMU: Acc (mg) [ ");  // Print accelerometer label
-  printFormattedFloat(sensor->accX(), 5, 2); SERIAL_PORT.print(", ");  // Print X acceleration
-  printFormattedFloat(sensor->accY(), 5, 2); SERIAL_PORT.print(", ");  // Print Y acceleration
-  printFormattedFloat(sensor->accZ(), 5, 2); SERIAL_PORT.print(" ] "); // Print Z acceleration
-
-  SERIAL_PORT.print("Gyr (DPS) [ ");  // Print gyroscope label
-  printFormattedFloat(sensor->gyrX(), 5, 2); SERIAL_PORT.print(", ");  // Print X rotation
-  printFormattedFloat(sensor->gyrY(), 5, 2); SERIAL_PORT.print(", ");  // Print Y rotation
-  printFormattedFloat(sensor->gyrZ(), 5, 2); SERIAL_PORT.print(" ]");  // Print Z rotation
-
-  SERIAL_PORT.println();              // Print newline
+  /*Serial.print("Scaled. Acc (G) [ ");
+  Serial.print(sensor->accX() / 1000.0, 2);
+  Serial.print(", ");
+  Serial.print(sensor->accY() / 1000.0, 2);
+  Serial.print(", ");
+  Serial.print(sensor->accZ() / 1000.0, 2);
+  Serial.print(" ], Gyr (DPS) [ ");
+  Serial.print(sensor->gyrX(), 2);
+  Serial.print(", ");
+  Serial.print(sensor->gyrY(), 2);
+  Serial.print(", ");
+  Serial.print(sensor->gyrZ(), 2);
+  Serial.print(" ], Mag (uT) [ ");
+  Serial.print(sensor->magX(), 2);
+  Serial.print(", ");
+  Serial.print(sensor->magY(), 2);
+  Serial.print(", ");
+  Serial.print(sensor->magZ(), 2);
+  Serial.println(" ]");*/
 }
-
-// ===================== LoRa COMMUNICATION =====================
 
 /**
  * Sends ALL sensor data and status flags via LoRa
- * Format: "TOF1:xxx,TOF2:xxx,PITCH:xx.x,ROLL:xx.x,YAW:xx.x,
- *          ACCX:x.xx,ACCY:x.xx,ACCZ:x.xx,GYRX:x.xx,GYRY:x.xx,GYRZ:x.xx,
- *          MAGX:x.xx,MAGY:x.xx,MAGZ:x.xx,TEMP:xx.x,
- *          DRIVE:x,BRUSH:x,ACTUATOR:x,OBSTACLE:x,DISORIENTED:x,EMERGENCY:x"
  */
 void sendLoRaData() {
   String loraData = "";               // Initialize data string
   
   // ToF Sensor data
-  loraData += "TOF1:" + String(tof1Distance);  // Add ToF sensor 1 data
-  loraData += ",TOF2:" + String(tof2Distance); // Add ToF sensor 2 data
+  loraData += "TOF1:" + String(tof1Distance);  // Add sensor 1
+  loraData += ",TOF2:" + String(tof2Distance); // Add sensor 2
   
   // IMU Orientation data
- // loraData += ",PITCH:" + String(imuPitch, 1); // Add pitch angle
- // loraData += ",ROLL:" + String(imuRoll, 1);   // Add roll angle
-  //loraData += ",YAW:" + String(imuYaw, 1);     // Add yaw angle
+  loraData += ",PITCH:" + String(currentPitch, 1); // Add pitch
+  loraData += ",ROLL:" + String(currentRoll, 1);   // Add roll
+  loraData += ",YAW:" + String(currentYaw, 1);     // Add yaw
   
   // IMU Raw Accelerometer data
   loraData += ",ACCX:" + String(accelX, 2);    // Add X acceleration
@@ -562,165 +768,116 @@ void sendLoRaData() {
   loraData += ",GYRZ:" + String(gyroZ, 2);     // Add Z rotation
   
   // IMU Raw Magnetometer data
-  //loraData += ",MAGX:" + String(magX, 2);      // Add X magnetic field
- // loraData += ",MAGY:" + String(magY, 2);      // Add Y magnetic field
-  //loraData += ",MAGZ:" + String(magZ, 2);      // Add Z magnetic field
+  loraData += ",MAGX:" + String(magX, 2);      // Add X magnetic
+  loraData += ",MAGY:" + String(magY, 2);      // Add Y magnetic
+  loraData += ",MAGZ:" + String(magZ, 2);      // Add Z magnetic
   
-  // IMU Temperature data
-  //loraData += ",TEMP:" + String(temperature, 1); // Add temperature
-  
-  // Status flags (1 = true/active, 0 = false/inactive)
-  loraData += ",DRIVE:" + String(driveMoving ? 1 : 0);      // Add drive motor status
-  loraData += ",BRUSH:" + String(brushMoving ? 1 : 0);      // Add brush motor status
- loraData += ",ACTUATOR:" + String(actuatorMoving ? 1 : 0); // Add actuator status
-  loraData += ",OBSTACLE:" + String(obstacleDetected ? 1 : 0);  // Add obstacle status
-  loraData += ",DISORIENTED:" + String(botDisoriented ? 1 : 0); // Add disoriented status
-  //loraData += ",EMERGENCY:" + String(emergencyStop ? 1 : 0);   // Add emergency stop status
+  // Status flags
+  loraData += ",DRIVE:" + String(driveMoving ? 1 : 0);      // Drive status
+  loraData += ",BRUSH:" + String(brushMoving ? 1 : 0);      // Brush status
+  loraData += ",ACTUATOR:" + String(actuatorMoving ? 1 : 0); // Actuator status
+  loraData += ",DIST_ALERT:" + String(obstacleDetected ? 1 : 0);  // Distance alert status
+  loraData += ",DISORIENTED:" + String(botDisoriented ? 1 : 0); // Fallen status
+  loraData += ",EMERGENCY:" + String(emergencyStop ? 1 : 0);   // Emergency status
 
   // Send via LoRa
-  LoRa.beginPacket();                 // Start LoRa packet
-  LoRa.print(loraData);               // Add data to packet
+  LoRa.beginPacket();                 // Start packet
+  LoRa.print(loraData);               // Add data
   LoRa.endPacket();                   // Send packet
 
-  SERIAL_PORT.println("LoRa Sent: " + loraData);  // Print sent data
+  SERIAL_PORT.println("LoRa Sent: " + loraData);  // Print data
 }
 
-// ===================== WiFi AND MOTOR FUNCTIONS =====================
+// ===================== MOTOR CONTROL FUNCTIONS =====================
 
-void handleWiFiClient() {
-  client = server.available();        // Check for client connection
-  
-  if (!client) return;                // Exit if no client
-
-  data = checkClient();               // Get data from client
-
-  if (data.length() == 0) return;     // Exit if no data
-
-  String command = data.substring(0, 1);  // Extract command character
-  int value = data.substring(1).toInt();  // Extract value
-
-  Serial.print("Received command: "); // Print received command
-  Serial.println(data);
-
-  // Execute command based on received character
-  if (command == "f") forward(value); // Move forward
-  else if (command == "r") reverse(value); // Move reverse
-  else if (command == "b") brake();   // Brake
-  else if (command == "c") run_brush(value); // Run brush
-  else if (command == "e") run_brush_rev(value); // Run brush reverse
-  else if (command == "s") stop_brush(); // Stop brush
-  else if (command == "l" || command == "m" || command == "n" || command == "o") move_actuator(value); // Move actuator
-  else if (command == "p") lin_stop(); // Stop actuator
-  else if (command == "x") resetStatusFlags(); // Reset status flags
-  client.stop();                      // Close client connection
-}
-
-String checkClient() {
-  while (!client.available()) {       // While no data available
-    delay(1);                         // Wait briefly
-  }
-  String request = client.readStringUntil('\r');  // Read until carriage return
-  request.remove(0, 5);               // Remove HTTP header
-  request.remove(request.length() - 9, 9);  // Remove HTTP footer
-  return request;                     // Return processed request
-}
-
-void move_actuator(int target_pos) {
-  if (actuatorMoving) return;         // Exit if actuator is already moving
-  
-  new_pos = target_pos;               // Set target position
-  dist = abs(pos - new_pos);          // Calculate distance to move
-  
-  if (dist > 0) {                     // If movement needed
-    actuatorMoving = true;            // Set moving flag
-    lastActionTime = millis();        // Record start time
-    if (pos < new_pos) lin_inc();     // Move increment if target is higher
-    else lin_dec();                   // Move decrement if target is lower
-  }
-}
-
-void handleActuator() {
-  if (actuatorMoving && millis() - lastActionTime >= calc_time(dist)) {  // If moving and time elapsed
-    lin_stop();                         // Stop actuator
-    actuatorMoving = false;             // Clear moving flag
-    pos = new_pos;                      // Update current position
-  }
-}
-
-// Motor Functions
 void forward(int pwm) {
-  driveMoving = true;                  // Set drive moving flag
-  emergencyStop = false;               // Clear emergency stop if moving
-  digitalWrite(dir_drive, HIGH);       // Set forward direction
-  analogWrite(pwm_drive, pwm);         // Set PWM speed
+  driveMoving = true;                  // Set flag
+  emergencyStop = false;               // Clear emergency
+  digitalWrite(dir_drive, HIGH);       // Set forward
+  analogWrite(pwm_drive, pwm);         // Set speed
 }
 
 void reverse(int pwm) {
-  driveMoving = true;                  // Set drive moving flag
-  emergencyStop = false;               // Clear emergency stop if moving
-  digitalWrite(dir_drive, LOW);        // Set reverse direction
-  analogWrite(pwm_drive, pwm);         // Set PWM speed
+  driveMoving = true;                  // Set flag
+  emergencyStop = false;               // Clear emergency
+  digitalWrite(dir_drive, LOW);        // Set reverse
+  analogWrite(pwm_drive, pwm);         // Set speed
 }
 
 void brake() {
-  driveMoving = false;                 // Clear drive moving flag
-  digitalWrite(dir_drive, LOW);        // Set direction (doesn't matter for brake)
-  analogWrite(pwm_drive, 0);           // Set PWM to 0 (brake)
+  driveMoving = false;                 // Clear flag
+  digitalWrite(dir_drive, LOW);        // Set direction
+  analogWrite(pwm_drive, 0);           // Stop
 }
 
 void run_brush(int pwm) {
-  brushMoving = true;                  // Set brush moving flag
-  emergencyStop = false;               // Clear emergency stop if moving
-  digitalWrite(dir_brush, HIGH);       // Set forward direction
-  analogWrite(pwm_brush, pwm);         // Set PWM speed
+  brushMoving = true;                  // Set flag
+  emergencyStop = false;               // Clear emergency
+  digitalWrite(dir_brush, HIGH);       // Set forward
+  analogWrite(pwm_brush, pwm);         // Set speed
 }
 
 void run_brush_rev(int pwm) {
-  brushMoving = true;                  // Set brush moving flag
-  emergencyStop = false;               // Clear emergency stop if moving
-  digitalWrite(dir_brush, LOW);        // Set reverse direction
-  analogWrite(pwm_brush, pwm);         // Set PWM speed
+  brushMoving = true;                  // Set flag
+  emergencyStop = false;               // Clear emergency
+  digitalWrite(dir_brush, LOW);        // Set reverse
+  analogWrite(pwm_brush, pwm);         // Set speed
 }
 
 void stop_brush() {
-  brushMoving = false;                 // Clear brush moving flag
-  analogWrite(pwm_brush, 0);           // Set PWM to 0 (stop)
+  brushMoving = false;                 // Clear flag
+  analogWrite(pwm_brush, 0);           // Stop
 }
 
-// Actuator Functions
-void lin_inc() {
-  actuatorMoving = true;               // Set actuator moving flag
-  emergencyStop = false;               // Clear emergency stop if moving
-  digitalWrite(lin_act_1_dir, LOW);    // Set increment direction
-  analogWrite(lin_act_1_pwm, linear_actr_pwm);  // Set PWM speed
+void handleActuator() {
+  if (actuatorMoving && millis() - lastActionTime >= calc_time(dist)) {  // If time elapsed
+    lin_stop();                         // Stop
+    actuatorMoving = false;             // Clear flag
+    pos = new_pos;                      // Update position
+  }
 }
 
-void lin_dec() {
-  actuatorMoving = true;               // Set actuator moving flag
-  emergencyStop = false;               // Clear emergency stop if moving
-  digitalWrite(lin_act_1_dir, HIGH);   // Set decrement direction
-  analogWrite(lin_act_1_pwm, linear_actr_pwm);  // Set PWM speed
+void forward_actuator(int pwm) {
+  actuatorMoving = true;               // Set flag
+  emergencyStop = false;               // Clear emergency
+  digitalWrite(lin_act_1_dir, LOW);    // Set up
+  analogWrite(lin_act_1_pwm, pwm);     // Set speed
+}
+
+void reverse_actuator(int pwm) {
+  actuatorMoving = true;               // Set flag
+  emergencyStop = false;               // Clear emergency
+  digitalWrite(lin_act_1_dir, HIGH);   // Set down
+  analogWrite(lin_act_1_pwm, pwm);     // Set speed
 }
 
 void lin_stop() {
-  actuatorMoving = false;              // Clear actuator moving flag
-  analogWrite(lin_act_1_pwm, 0);       // Set PWM to 0 (stop)
+  actuatorMoving = false;              // Clear flag
+  analogWrite(lin_act_1_pwm, 0);       // Stop
 }
 
-// === Reset Status Flags ===
+/**
+ * Reset Status Flags
+ */
 void resetStatusFlags() {
-  driveMoving = false;
-  brushMoving = false;
-  actuatorMoving = false;
-  obstacleDetected = false;
-  // Don't reset botDisoriented and emergencyStop as they need manual reset
-  Serial.println("Status flags reset");
+  driveMoving = false;                 // Clear drive flag
+  brushMoving = false;                 // Clear brush flag
+  actuatorMoving = false;              // Clear actuator flag
+  obstacleDetected = false;            // Clear distance alert flag
+  // Don't reset fallen and emergency flags
+  Serial.println("Status flags reset"); // Print message
 }
 
+/**
+ * Calculate time needed for actuator movement
+ */
 int calc_time(int dist) {
-  return (int)(1000 * dist / 6.893);   // Calculate time needed for movement
+  return (int)(1000 * dist / 6.893);   // Calculate time needed
 }
 
+/**
+ * Calculate PWM from voltage
+ */
 int calc_pwm(float volt) {
   return (int)((11.0 / volt) * 255);   // Calculate PWM from voltage
 }
