@@ -21,7 +21,7 @@
 //---------------------------------------------------------------------------------------------------------------------------------------
 // WiFi network settings
 const char *ssid = "MyESP32_AP";        // WiFi network name
-const char *password = "12345678";      // WiFi password
+const char *password = "23121234";      // WiFi password
 
 // Create a WebServer on port 80
 WebServer server(80);                   // Web server on port 80
